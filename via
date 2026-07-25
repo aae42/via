@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOMAIN="via.stulta.dev"
+SLOTS=(amber-otter brisk-heron cobalt-lynx dusky-moth
+       ember-finch fern-vole glass-shrike hazel-marten)
+STATE="${TMPDIR:-/tmp}/via-slots"
+mkdir -p "$STATE"
+CMD="${1:?usage: via <local-port> [slot] | via status}"
+
+# The public 503 page can't distinguish "no client connected" from "client
+# connected but the local port isn't answering HTTP" -- so a slot we already
+# hold looks free to the next run, and both clients then fight over it. Take a
+# local lock per slot as the authoritative claim for this machine.
+claim() {
+	local d="$STATE/$1" pid
+	mkdir "$d" 2>/dev/null && { echo $$ >"$d/pid"; lock="$d"; return 0; }
+	pid=$(cat "$d/pid" 2>/dev/null) || true
+	[[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && return 1
+	rm -rf "$d"
+	mkdir "$d" 2>/dev/null && { echo $$ >"$d/pid"; lock="$d"; return 0; }
+	return 1
+}
+
+# echoes free|occupied. Caddy sets X-Via-Slot: a dial-refused upstream means no
+# client is attached (free), anything else means one is (occupied). Servers
+# without that route only give us the status code, where 503 means free.
+probe() {
+	local out state
+	out=$(curl -s -o /dev/null -D - -w '%{http_code}' --max-time 5 "https://$1.$DOMAIN" 2>/dev/null) || out=000
+	state=$(printf '%s' "$out" | tr -d '\r' | awk 'tolower($1)=="x-via-slot:"{print tolower($2)}' | tail -1)
+	if [[ -n "$state" ]]; then
+		echo "$state"
+	elif [[ "${out##*$'\n'}" == 503 ]]; then
+		echo free
+	else
+		echo occupied  # includes timeouts: never steal a slot we can't read
+	fi
+}
+
+# Probes every slot at once, pairing the remote view with this machine's lock:
+# "occupied" with no local lock means some other machine holds the slot.
+status() {
+	local tmp s remote pid held
+	tmp=$(mktemp -d)
+	for s in "${SLOTS[@]}"; do probe "$s" >"$tmp/$s" & done
+	wait
+	printf '%-14s %-9s %s\n' SLOT REMOTE 'THIS MACHINE'
+	for s in "${SLOTS[@]}"; do
+		remote=$(cat "$tmp/$s")
+		pid=$(cat "$STATE/$s/pid" 2>/dev/null) || true
+		if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+			held="pid $pid"
+		elif [[ -d "$STATE/$s" ]]; then
+			held="stale lock"
+		else
+			held="-"
+		fi
+		printf '%-14s %-9s %s\n' "$s" "$remote" "$held"
+	done
+	rm -rf "$tmp"
+}
+
+# sets $name and $lock on success
+pick() {
+	local s
+	for s in "${SLOTS[@]}"; do
+		claim "$s" || continue
+		[[ "$(probe "$s")" == free ]] && { name="$s"; return 0; }
+		rm -rf "$lock"; lock=  # claimed from another machine
+	done
+	return 1
+}
+
+if [[ "$CMD" == status ]]; then
+	status
+	exit 0
+fi
+
+LOCAL_PORT="$CMD"
+WANT="${2:-}"
+VIA_ENTRY="rathole via.stulta.dev hawk"
+VIA_TOKEN="${VIA_TOKEN:-$(rbw get "$VIA_ENTRY" --field token)}"
+VIA_PUBKEY="${VIA_PUBKEY:-$(rbw get "$VIA_ENTRY")}"
+: "${VIA_TOKEN:?set VIA_TOKEN or ensure rbw returns a token}"
+: "${VIA_PUBKEY:?set VIA_PUBKEY or ensure rbw returns a pubkey}"
+
+lock=
+name=
+cfg=
+cleanup() {
+	[[ -n "$cfg" ]] && rm -f "$cfg"
+	[[ -n "$lock" ]] && rm -rf "$lock"
+	return 0
+}
+trap cleanup EXIT INT TERM
+
+if [[ -n "$WANT" ]]; then
+	name="$WANT"
+	claim "$name" || { echo "slot $name is already in use on this machine"; exit 1; }
+	if [[ "$(probe "$name")" != free && -z "${VIA_FORCE:-}" ]]; then
+		echo "slot $name is in use elsewhere; VIA_FORCE=1 to take it anyway"
+		exit 1
+	fi
+else
+	pick || { echo "no free slots"; exit 1; }
+fi
+
+cfg=$(mktemp)
+chmod 600 "$cfg"
+cat >"$cfg" <<TOML
+[client]
+remote_addr = "via.stulta.dev:2333"
+default_token = "$VIA_TOKEN"
+
+[client.transport]
+type = "noise"
+
+[client.transport.noise]
+remote_public_key = "$VIA_PUBKEY"
+
+[client.services.$name]
+local_addr = "127.0.0.1:$LOCAL_PORT"
+TOML
+
+printf '  https://%s.%s  ->  localhost:%s\n  ctrl-c to close\n' "$name" "$DOMAIN" "$LOCAL_PORT"
+rathole --client "$cfg"  # not exec'd, so the trap can release the slot lock
