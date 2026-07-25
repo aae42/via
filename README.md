@@ -8,7 +8,7 @@ testing (particularly useful for testing OIDC claims/webhook-type stuff)
 requires [rathole](https://github.com/rathole-org/rathole)
 
 this one's set up to pull my keys/tokens from bitwarden,
-and hard coded to my remote setup
+and otherwise pretty hard-coded to my personal remote setup
 
 this repo's more of a "how i'm doing it", and this seemed to be better than
 using a github gist for some reason
