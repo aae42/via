@@ -17,7 +17,7 @@ on the client side it needs:
 
 a slot is a public URL, so by default nothing hits my local port unauthenticated:
 wstunnel dials a local caddy that demands basic auth and forwards on. `VIA_PASS`
-is required (no random generation); user defaults to `via`.
+is required (no random generation); user defaults to `$USER`.
 
 - `VIA_PASS=hunter2 via 3000` serves behind basic auth
 - `VIA_USER=me VIA_PASS=hunter2 via 3000` changes the username

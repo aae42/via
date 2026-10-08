@@ -14,7 +14,7 @@ VIA_KEY="${VIA_KEY:-}"
 VIA_SOCKET_DIR="${VIA_SOCKET_DIR:-/run/via}"   # path on the SERVER
 VIA_WSTUNNEL="${VIA_WSTUNNEL:-wstunnel}"
 VIA_NOAUTH="${VIA_NOAUTH:-}"                   # 1 = expose ports raw, no basic auth
-VIA_USER="${VIA_USER:-via}"
+VIA_USER="${VIA_USER:-${USER:-via}}"
 VIA_PASS="${VIA_PASS:-}"                       # required unless VIA_NOAUTH=1
 VIA_AUTH_BASE_PORT="${VIA_AUTH_BASE_PORT:-21400}"  # local caddy listeners start here
 
@@ -169,7 +169,7 @@ if [ -z "$VIA_NOAUTH" ]; then
 	{
 		printf '{\n\tadmin off\n\tauto_https off\n}\n'
 		for site in "${sites[@]}"; do
-			printf 'http://127.0.0.1:%s {\n\tbasic_auth {\n\t\t%s %s\n\t}\n\treverse_proxy %s\n}\n' \
+			printf ':%s {\n\tbind 127.0.0.1\n\tbasic_auth {\n\t\t%s %s\n\t}\n\treverse_proxy %s\n}\n' \
 				"${site%% *}" "$VIA_USER" "$hash" "${site#* }"
 		done
 	} >"$authcfg"
@@ -188,7 +188,7 @@ fi
 echo "via: connecting to $VIA_SERVER"
 printf '  %s\n' "${urls[@]}"
 if [ -z "$VIA_NOAUTH" ]; then
-	echo "  basic auth as user '$VIA_USER'"
+	echo "  basic auth: user '$VIA_USER'"
 else
 	echo "  no auth (VIA_NOAUTH)"
 fi
