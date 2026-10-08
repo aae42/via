@@ -16,11 +16,12 @@ on the client side it needs:
 ## auth
 
 a slot is a public URL, so by default nothing hits my local port unauthenticated:
-rathole dials a local caddy that demands basic auth and forwards on. `via` prints
-a fresh random password each run alongside the URL.
+wstunnel dials a local caddy that demands basic auth and forwards on. `VIA_PASS`
+is required (no random generation); user defaults to `via`.
 
+- `VIA_PASS=hunter2 via 3000` serves behind basic auth
+- `VIA_USER=me VIA_PASS=hunter2 via 3000` changes the username
 - `VIA_NOAUTH=1 via 3000` exposes the port raw
-- `VIA_USER=me VIA_PASS=hunter2 via 3000` pins the creds instead of randomizing
 
 this repo's more of a "how i'm doing it", and this seemed to be better than
 using a github gist for some reason

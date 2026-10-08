@@ -13,6 +13,10 @@ VIA_CERT="${VIA_CERT:-}"                       # set both to use files instead o
 VIA_KEY="${VIA_KEY:-}"
 VIA_SOCKET_DIR="${VIA_SOCKET_DIR:-/run/via}"   # path on the SERVER
 VIA_WSTUNNEL="${VIA_WSTUNNEL:-wstunnel}"
+VIA_NOAUTH="${VIA_NOAUTH:-}"                   # 1 = expose ports raw, no basic auth
+VIA_USER="${VIA_USER:-via}"
+VIA_PASS="${VIA_PASS:-}"                       # required unless VIA_NOAUTH=1
+VIA_AUTH_BASE_PORT="${VIA_AUTH_BASE_PORT:-21400}"  # local caddy listeners start here
 
 adjectives=(amber brisk cobalt dusky ember fern glass hazel ivory jade keen lunar
 	misty nimble opal plucky quartz rustic sandy tidy umber vivid witty zesty
@@ -30,6 +34,27 @@ random_name() {
 die()  { echo "via: $*" >&2; exit 1; }
 warn() { echo "via: warning: $*" >&2; }
 
+authcfg=
+authpid=
+cleanup() {
+	[ -n "$authpid" ] && kill "$authpid" 2>/dev/null
+	[ -n "$authcfg" ] && rm -f "$authcfg"
+	return 0
+}
+trap cleanup EXIT INT TERM
+
+listening() { (: </dev/tcp/127.0.0.1/"$1") 2>/dev/null; }
+
+# first local port >= base that nothing listens on and we haven't already handed out
+auth_ports=" "
+free_port() {
+	up=$VIA_AUTH_BASE_PORT
+	while case "$auth_ports" in *" $up "*) true ;; *) listening "$up" ;; esac; do
+		up=$((up + 1))
+	done
+	auth_ports="$auth_ports$up "
+}
+
 usage() {
 	cat <<EOF
 Usage: via [options] [NAME=][HOST:]PORT ...
@@ -41,13 +66,18 @@ Examples:
   via db=192.168.1.5:5432   target a different host on your LAN
 
 Options:
-  -n    dry run: print the wstunnel command and exit (doesn't touch rbw)
+  -n    dry run: print the wstunnel command and exit (doesn't touch rbw or caddy)
   -d    wstunnel debug logging
   -h    this help
 
 Settings (env vars or $CONFIG):
   VIA_SERVER=$VIA_SERVER
   VIA_RBW_ITEM=$VIA_RBW_ITEM   (or VIA_CERT / VIA_KEY to use files)
+
+Auth: every tunnel is public, so a local caddy puts basic auth in front of
+each port. VIA_PASS is required (user defaults to "$VIA_USER", set VIA_USER to change).
+  VIA_PASS=hunter2 via 3000
+  VIA_NOAUTH=1 via 3000     expose the port raw instead
 EOF
 }
 
@@ -67,6 +97,8 @@ command -v "$VIA_WSTUNNEL" >/dev/null 2>&1 || die "wstunnel not found (set VIA_W
 
 args=()
 urls=()
+sites=()
+upstreams=()
 seen=" "
 for spec in "$@"; do
 	case "$spec" in
@@ -101,7 +133,15 @@ for spec in "$@"; do
 				|| warn "nothing is listening on $host:$port yet" ;;
 	esac
 
-	args+=(-R "unix://$VIA_SOCKET_DIR/$name.sock:$host:$port")
+	if [ -z "$VIA_NOAUTH" ]; then
+		# wstunnel dials the caddy listener; caddy checks auth, then proxies on
+		free_port   # sets $up
+		upstreams+=("$up")
+		sites+=("$up $host:$port")
+		args+=(-R "unix://$VIA_SOCKET_DIR/$name.sock:127.0.0.1:$up")
+	else
+		args+=(-R "unix://$VIA_SOCKET_DIR/$name.sock:$host:$port")
+	fi
 	urls+=("https://$name.$VIA_DOMAIN  ->  $host:$port")
 done
 
@@ -116,16 +156,49 @@ if [ "$dry" -eq 1 ]; then
 		--tls-private-key "<rbw:$VIA_RBW_ITEM/key>" \
 		"${args[@]}" "wss://$VIA_SERVER:443"
 	echo
+	[ -z "$VIA_NOAUTH" ] && echo "# basic auth via local caddy on 127.0.0.1:${upstreams[*]}" >&2
 	exit 0
+fi
+
+if [ -z "$VIA_NOAUTH" ]; then
+	[ -n "$VIA_PASS" ] || die "VIA_PASS is required (or VIA_NOAUTH=1 to expose without auth)"
+	command -v caddy >/dev/null 2>&1 || die "caddy not found (needed for basic auth; VIA_NOAUTH=1 to skip)"
+	authcfg=$(mktemp)
+	chmod 600 "$authcfg"
+	hash=$(caddy hash-password --plaintext "$VIA_PASS")
+	{
+		printf '{\n\tadmin off\n\tauto_https off\n}\n'
+		for site in "${sites[@]}"; do
+			printf 'http://127.0.0.1:%s {\n\tbasic_auth {\n\t\t%s %s\n\t}\n\treverse_proxy %s\n}\n' \
+				"${site%% *}" "$VIA_USER" "$hash" "${site#* }"
+		done
+	} >"$authcfg"
+	caddy run --adapter caddyfile --config "$authcfg" >/dev/null 2>&1 &
+	authpid=$!
+	for up in "${upstreams[@]}"; do
+		for _ in $(seq 50); do
+			listening "$up" && break
+			kill -0 "$authpid" 2>/dev/null || die "local auth proxy failed to start"
+			sleep 0.1
+		done
+		listening "$up" || die "local auth proxy didn't come up on port $up"
+	done
 fi
 
 echo "via: connecting to $VIA_SERVER"
 printf '  %s\n' "${urls[@]}"
+if [ -z "$VIA_NOAUTH" ]; then
+	echo "  basic auth as user '$VIA_USER'"
+else
+	echo "  no auth (VIA_NOAUTH)"
+fi
 echo "  (Ctrl-C to stop)"
 
 if [ -n "$VIA_CERT" ] && [ -n "$VIA_KEY" ]; then
-	exec "${cmd[@]}" --tls-certificate "$VIA_CERT" --tls-private-key "$VIA_KEY" \
+	# not exec'd, so the trap can stop the local caddy
+	"${cmd[@]}" --tls-certificate "$VIA_CERT" --tls-private-key "$VIA_KEY" \
 		"${args[@]}" "wss://$VIA_SERVER:443"
+	exit
 fi
 
 command -v rbw >/dev/null 2>&1 || die "rbw not found (or set VIA_CERT and VIA_KEY)"
@@ -135,7 +208,7 @@ rbw get "$VIA_RBW_ITEM" --field cert >/dev/null || die "couldn't read '$VIA_RBW_
 
 # the <(...) must stay directly on this line: bash closes the pipes if they
 # are stored in a variable or array first
-exec "${cmd[@]}" \
+"${cmd[@]}" \
 	--tls-certificate <(fetch cert) \
 	--tls-private-key <(fetch key) \
 	"${args[@]}" "wss://$VIA_SERVER:443"
