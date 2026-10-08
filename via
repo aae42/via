@@ -8,8 +8,9 @@ CONFIG="${VIA_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/via/config}"
 
 VIA_DOMAIN="${VIA_DOMAIN:-via.stulta.dev}"
 VIA_SERVER="${VIA_SERVER:-connect.$VIA_DOMAIN}"
-VIA_CERT="${VIA_CERT:-$HOME/.via/client.crt}"
-VIA_KEY="${VIA_KEY:-$HOME/.via/client.key}"
+VIA_RBW_ITEM="${VIA_RBW_ITEM:-via-wstunnel}"   # rbw item with base64 "cert" and "key" fields
+VIA_CERT="${VIA_CERT:-}"                       # set both to use files instead of rbw
+VIA_KEY="${VIA_KEY:-}"
 VIA_SOCKET_DIR="${VIA_SOCKET_DIR:-/run/via}"   # path on the SERVER
 VIA_WSTUNNEL="${VIA_WSTUNNEL:-wstunnel}"
 
@@ -40,14 +41,13 @@ Examples:
   via db=192.168.1.5:5432   target a different host on your LAN
 
 Options:
-  -n    dry run: print the wstunnel command and exit
+  -n    dry run: print the wstunnel command and exit (doesn't touch rbw)
   -d    wstunnel debug logging
   -h    this help
 
 Settings (env vars or $CONFIG):
   VIA_SERVER=$VIA_SERVER
-  VIA_CERT=$VIA_CERT
-  VIA_KEY=$VIA_KEY
+  VIA_RBW_ITEM=$VIA_RBW_ITEM   (or VIA_CERT / VIA_KEY to use files)
 EOF
 }
 
@@ -84,7 +84,6 @@ for spec in "$@"; do
 
 	if [ -z "$name" ]; then
 		name="$(random_name)"
-		# avoid a duplicate within this command
 		while case "$seen" in *" $name "*) true ;; *) false ;; esac; do
 			name="$(random_name)"
 		done
@@ -96,7 +95,6 @@ for spec in "$@"; do
 	case "$seen" in *" $name "*) die "name '$name' used twice" ;; esac
 	seen="$seen$name "
 
-	# warn if nothing is listening locally (bash's /dev/tcp)
 	case "$host" in
 		localhost|127.0.0.1)
 			(: </dev/tcp/127.0.0.1/"$port") 2>/dev/null \
@@ -107,18 +105,37 @@ for spec in "$@"; do
 	urls+=("https://$name.$VIA_DOMAIN  ->  $host:$port")
 done
 
-cmd=("$VIA_WSTUNNEL" client
-	--tls-certificate "$VIA_CERT"
-	--tls-private-key "$VIA_KEY")
+fetch() { rbw get "$VIA_RBW_ITEM" --field "$1" | base64 --decode; }
+
+cmd=("$VIA_WSTUNNEL" client)
 [ "$debug" -eq 1 ] && cmd+=(--log-lvl DEBUG)
-cmd+=("${args[@]}" "wss://$VIA_SERVER:443")
 
 if [ "$dry" -eq 1 ]; then
-	printf '%q ' "${cmd[@]}"; echo
+	printf '%q ' "${cmd[@]}" \
+		--tls-certificate "<rbw:$VIA_RBW_ITEM/cert>" \
+		--tls-private-key "<rbw:$VIA_RBW_ITEM/key>" \
+		"${args[@]}" "wss://$VIA_SERVER:443"
+	echo
 	exit 0
 fi
 
 echo "via: connecting to $VIA_SERVER"
 printf '  %s\n' "${urls[@]}"
 echo "  (Ctrl-C to stop)"
-exec "${cmd[@]}"
+
+if [ -n "$VIA_CERT" ] && [ -n "$VIA_KEY" ]; then
+	exec "${cmd[@]}" --tls-certificate "$VIA_CERT" --tls-private-key "$VIA_KEY" \
+		"${args[@]}" "wss://$VIA_SERVER:443"
+fi
+
+command -v rbw >/dev/null 2>&1 || die "rbw not found (or set VIA_CERT and VIA_KEY)"
+# preflight so a locked vault or wrong item name gives a clear error
+# instead of wstunnel choking on an empty pipe
+rbw get "$VIA_RBW_ITEM" --field cert >/dev/null || die "couldn't read '$VIA_RBW_ITEM' from rbw"
+
+# the <(...) must stay directly on this line: bash closes the pipes if they
+# are stored in a variable or array first
+exec "${cmd[@]}" \
+	--tls-certificate <(fetch cert) \
+	--tls-private-key <(fetch key) \
+	"${args[@]}" "wss://$VIA_SERVER:443"
