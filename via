@@ -1,171 +1,124 @@
 #!/usr/bin/env bash
+# via: expose local ports at <name>.via.stulta.dev through wstunnel
 set -euo pipefail
 
-DOMAIN="via.stulta.dev"
-SLOTS=(amber-otter brisk-heron cobalt-lynx dusky-moth
-       ember-finch fern-vole glass-shrike hazel-marten)
-STATE="${TMPDIR:-/tmp}/via-slots"
-mkdir -p "$STATE"
-CMD="${1:?usage: via <local-port> [slot] | via status}"
+CONFIG="${VIA_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/via/config}"
+# shellcheck disable=SC1090
+[ -f "$CONFIG" ] && . "$CONFIG"
 
-# The public 503 page can't distinguish "no client connected" from "client
-# connected but the local port isn't answering HTTP" -- so a slot we already
-# hold looks free to the next run, and both clients then fight over it. Take a
-# local lock per slot as the authoritative claim for this machine.
-claim() {
-	local d="$STATE/$1" pid
-	mkdir "$d" 2>/dev/null && { echo $$ >"$d/pid"; lock="$d"; return 0; }
-	pid=$(cat "$d/pid" 2>/dev/null) || true
-	[[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && return 1
-	rm -rf "$d"
-	mkdir "$d" 2>/dev/null && { echo $$ >"$d/pid"; lock="$d"; return 0; }
-	return 1
+VIA_DOMAIN="${VIA_DOMAIN:-via.stulta.dev}"
+VIA_SERVER="${VIA_SERVER:-connect.$VIA_DOMAIN}"
+VIA_CERT="${VIA_CERT:-$HOME/.via/client.crt}"
+VIA_KEY="${VIA_KEY:-$HOME/.via/client.key}"
+VIA_SOCKET_DIR="${VIA_SOCKET_DIR:-/run/via}"   # path on the SERVER
+VIA_WSTUNNEL="${VIA_WSTUNNEL:-wstunnel}"
+
+adjectives=(amber brisk cobalt dusky ember fern glass hazel ivory jade keen lunar
+	misty nimble opal plucky quartz rustic sandy tidy umber vivid witty zesty
+	bold calm dapper eager fuzzy gentle humble jolly lucky mellow noble proud
+	quiet rapid sunny tawny wild wise young)
+animals=(otter heron lynx moth finch vole shrike marten badger crane drake egret
+	ferret gecko hare ibis jackal koala lemur mole newt osprey panda quail raven
+	seal stoat tapir urchin viper wren yak zebra bison civet dingo elk fox gull
+	ibex)
+
+random_name() {
+	echo "${adjectives[RANDOM % ${#adjectives[@]}]}-${animals[RANDOM % ${#animals[@]}]}"
 }
 
-# echoes free|occupied. Caddy sets X-Via-Slot: a dial-refused upstream means no
-# client is attached (free), anything else means one is (occupied). Servers
-# without that route only give us the status code, where 503 means free.
-probe() {
-	local out state
-	out=$(curl -s -o /dev/null -D - -w '%{http_code}' --max-time 5 "https://$1.$DOMAIN" 2>/dev/null) || out=000
-	state=$(printf '%s' "$out" | tr -d '\r' | awk 'tolower($1)=="x-via-slot:"{print tolower($2)}' | tail -1)
-	if [[ -n "$state" ]]; then
-		echo "$state"
-	elif [[ "${out##*$'\n'}" == 503 ]]; then
-		echo free
-	else
-		echo occupied  # includes timeouts: never steal a slot we can't read
+die()  { echo "via: $*" >&2; exit 1; }
+warn() { echo "via: warning: $*" >&2; }
+
+usage() {
+	cat <<EOF
+Usage: via [options] [NAME=][HOST:]PORT ...
+
+Examples:
+  via 3000                  random name  -> https://<adjective-animal>.$VIA_DOMAIN
+  via web=3000              -> https://web.$VIA_DOMAIN
+  via web=3000 api=8080     several tunnels over one connection
+  via db=192.168.1.5:5432   target a different host on your LAN
+
+Options:
+  -n    dry run: print the wstunnel command and exit
+  -d    wstunnel debug logging
+  -h    this help
+
+Settings (env vars or $CONFIG):
+  VIA_SERVER=$VIA_SERVER
+  VIA_CERT=$VIA_CERT
+  VIA_KEY=$VIA_KEY
+EOF
+}
+
+dry=0; debug=0
+while getopts ":ndh" opt; do
+	case "$opt" in
+		n) dry=1 ;;
+		d) debug=1 ;;
+		h) usage; exit 0 ;;
+		*) usage >&2; exit 1 ;;
+	esac
+done
+shift $((OPTIND - 1))
+[ $# -gt 0 ] || { usage >&2; exit 1; }
+
+command -v "$VIA_WSTUNNEL" >/dev/null 2>&1 || die "wstunnel not found (set VIA_WSTUNNEL)"
+
+args=()
+urls=()
+seen=" "
+for spec in "$@"; do
+	case "$spec" in
+		*=*) name=${spec%%=*}; target=${spec#*=} ;;
+		*)   name="";          target=$spec ;;
+	esac
+
+	case "$target" in
+		*:*) host=${target%:*}; port=${target##*:} ;;
+		*)   host=localhost;    port=$target ;;
+	esac
+
+	[[ $port =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] \
+		|| die "bad port in '$spec'"
+
+	if [ -z "$name" ]; then
+		name="$(random_name)"
+		# avoid a duplicate within this command
+		while case "$seen" in *" $name "*) true ;; *) false ;; esac; do
+			name="$(random_name)"
+		done
 	fi
-}
 
-# Probes every slot at once, pairing the remote view with this machine's lock:
-# "occupied" with no local lock means some other machine holds the slot.
-status() {
-	local tmp s remote pid held
-	tmp=$(mktemp -d)
-	for s in "${SLOTS[@]}"; do probe "$s" >"$tmp/$s" & done
-	wait
-	printf '%-14s %-9s %s\n' SLOT REMOTE 'THIS MACHINE'
-	for s in "${SLOTS[@]}"; do
-		remote=$(cat "$tmp/$s")
-		pid=$(cat "$STATE/$s/pid" 2>/dev/null) || true
-		if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-			held="pid $pid"
-		elif [[ -d "$STATE/$s" ]]; then
-			held="stale lock"
-		else
-			held="-"
-		fi
-		printf '%-14s %-9s %s\n' "$s" "$remote" "$held"
-	done
-	rm -rf "$tmp"
-}
+	# same shape the server's Caddy matcher accepts, minus leading/trailing '-'
+	[[ $name =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] \
+		|| die "bad name '$name' (lowercase letters, digits and '-', max 63 chars)"
+	case "$seen" in *" $name "*) die "name '$name' used twice" ;; esac
+	seen="$seen$name "
 
-# sets $name and $lock on success
-pick() {
-	local s
-	for s in "${SLOTS[@]}"; do
-		claim "$s" || continue
-		[[ "$(probe "$s")" == free ]] && { name="$s"; return 0; }
-		rm -rf "$lock"; lock=  # claimed from another machine
-	done
-	return 1
-}
+	# warn if nothing is listening locally (bash's /dev/tcp)
+	case "$host" in
+		localhost|127.0.0.1)
+			(: </dev/tcp/127.0.0.1/"$port") 2>/dev/null \
+				|| warn "nothing is listening on $host:$port yet" ;;
+	esac
 
-if [[ "$CMD" == status ]]; then
-	status
+	args+=(-R "unix://$VIA_SOCKET_DIR/$name.sock:$host:$port")
+	urls+=("https://$name.$VIA_DOMAIN  ->  $host:$port")
+done
+
+cmd=("$VIA_WSTUNNEL" client
+	--tls-certificate "$VIA_CERT"
+	--tls-private-key "$VIA_KEY")
+[ "$debug" -eq 1 ] && cmd+=(--log-lvl DEBUG)
+cmd+=("${args[@]}" "wss://$VIA_SERVER:443")
+
+if [ "$dry" -eq 1 ]; then
+	printf '%q ' "${cmd[@]}"; echo
 	exit 0
 fi
 
-LOCAL_PORT="$CMD"
-WANT="${2:-}"
-VIA_ENTRY="rathole via.stulta.dev hawk"
-VIA_TOKEN="${VIA_TOKEN:-$(rbw get "$VIA_ENTRY" --field token)}"
-VIA_PUBKEY="${VIA_PUBKEY:-$(rbw get "$VIA_ENTRY")}"
-: "${VIA_TOKEN:?set VIA_TOKEN or ensure rbw returns a token}"
-: "${VIA_PUBKEY:?set VIA_PUBKEY or ensure rbw returns a pubkey}"
-
-lock=
-name=
-cfg=
-authcfg=
-authpid=
-cleanup() {
-	[[ -n "$authpid" ]] && kill "$authpid" 2>/dev/null
-	[[ -n "$authcfg" ]] && rm -f "$authcfg"
-	[[ -n "$cfg" ]] && rm -f "$cfg"
-	[[ -n "$lock" ]] && rm -rf "$lock"
-	return 0
-}
-trap cleanup EXIT INT TERM
-
-if [[ -n "$WANT" ]]; then
-	name="$WANT"
-	claim "$name" || { echo "slot $name is already in use on this machine"; exit 1; }
-	if [[ "$(probe "$name")" != free && -z "${VIA_FORCE:-}" ]]; then
-		echo "slot $name is in use elsewhere; VIA_FORCE=1 to take it anyway"
-		exit 1
-	fi
-else
-	pick || { echo "no free slots"; exit 1; }
-fi
-
-# A slot is a public URL, so gate it by default: rathole dials a local Caddy
-# that demands basic auth and forwards on. The listen port is derived from the
-# slot index, which the slot lock already guarantees is ours alone on this
-# machine. VIA_NOAUTH=1 exposes the port raw; VIA_USER/VIA_PASS pin creds.
-UPSTREAM_PORT="$LOCAL_PORT"
-if [[ -z "${VIA_NOAUTH:-}" ]]; then
-	idx=0
-	for i in "${!SLOTS[@]}"; do [[ "${SLOTS[$i]}" == "$name" ]] && idx=$i; done
-	UPSTREAM_PORT=$((21400 + idx))
-	VIA_USER="${VIA_USER:-via}"
-	VIA_PASS="${VIA_PASS:-$(openssl rand -base64 12 | tr -dc 'A-Za-z0-9')}"
-	authcfg=$(mktemp)
-	chmod 600 "$authcfg"
-	cat >"$authcfg" <<CADDY
-{
-	admin off
-	auto_https off
-}
-:$UPSTREAM_PORT {
-	basic_auth {
-		$VIA_USER $(caddy hash-password --plaintext "$VIA_PASS")
-	}
-	reverse_proxy 127.0.0.1:$LOCAL_PORT
-}
-CADDY
-	caddy run --adapter caddyfile --config "$authcfg" >/dev/null 2>&1 &
-	authpid=$!
-	for _ in $(seq 50); do
-		curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$UPSTREAM_PORT" && break
-		kill -0 "$authpid" 2>/dev/null || { echo "local auth proxy failed to start"; exit 1; }
-		sleep 0.1
-	done
-fi
-
-cfg=$(mktemp)
-chmod 600 "$cfg"
-cat >"$cfg" <<TOML
-[client]
-remote_addr = "via.stulta.dev:2333"
-default_token = "$VIA_TOKEN"
-
-[client.transport]
-type = "noise"
-
-[client.transport.noise]
-remote_public_key = "$VIA_PUBKEY"
-
-[client.services.$name]
-local_addr = "127.0.0.1:$UPSTREAM_PORT"
-TOML
-
-printf '  https://%s.%s  ->  localhost:%s\n' "$name" "$DOMAIN" "$LOCAL_PORT"
-if [[ -n "$authpid" ]]; then
-	printf '  %s / %s\n' "$VIA_USER" "$VIA_PASS"
-else
-	printf '  no auth (VIA_NOAUTH)\n'
-fi
-printf '  ctrl-c to close\n'
-rathole --client "$cfg"  # not exec'd, so the trap can release the slot lock
+echo "via: connecting to $VIA_SERVER"
+printf '  %s\n' "${urls[@]}"
+echo "  (Ctrl-C to stop)"
+exec "${cmd[@]}"

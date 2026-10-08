@@ -7,15 +7,11 @@ testing (particularly useful for testing OIDC claims/webhook-type stuff)
 
 on the client side it needs:
 
-- [rathole](https://github.com/rathole-org/rathole) — the tunnel itself
+- [wstunnel](https://github.com/erebe/wstunnel) — the tunnel itself
 - [caddy](https://caddyserver.com/) — runs locally too, to put basic auth in
   front of whatever port i'm exposing (see below)
-- [rbw](https://github.com/doy/rbw) — unlocked, to pull the token/pubkey out of
-  bitwarden. `VIA_TOKEN`/`VIA_PUBKEY` in the env skip this
-- curl and openssl, which macOS already has
-
-this one's set up to pull my keys/tokens from bitwarden,
-and otherwise pretty hard-coded to my personal remote setup
+- [rbw](https://github.com/doy/rbw) — unlocked, to pull the mTLS cert/key out of
+  bitwarden. `VIA_CERT`/`VIA_KEY` in the env skip this
 
 ## auth
 
@@ -34,8 +30,5 @@ using a github gist for some reason
 requires a publicly accessible server to run all the server side goodies
 
 another [caddy](https://caddyserver.com/) does TLS termination for these
-endpoints, and [rathole](https://github.com/rathole-org/rathole) server does the
-listening and redirecting, while rathole and this script does the client side
-stuff.
-
-pretty low tech but so far, it get's the job done
+endpoints, and [wstunnel](https://github.com/erebe/wstunnel) server does the
+listening and redirecting
